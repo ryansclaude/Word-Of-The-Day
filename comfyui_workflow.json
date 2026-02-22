@@ -1,0 +1,98 @@
+{
+  "1": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "clip": ["8", 0],
+      "text": "{{PROMPT_TEXT}}"
+    }
+  },
+  "2": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "clip": ["8", 0],
+      "text": "blurry, watermark, text artifacts, deformed hands, bad anatomy, low quality, ugly, nsfw"
+    }
+  },
+  "3": {
+    "class_type": "KSampler",
+    "inputs": {
+      "model": ["4", 0],
+      "positive": ["1", 0],
+      "negative": ["2", 0],
+      "latent_image": ["5", 0],
+      "seed": 42,
+      "steps": 20,
+      "cfg": 3.5,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 1.0
+    }
+  },
+  "4": {
+    "class_type": "UnetLoaderGGUF",
+    "inputs": {
+      "unet_name": "flux1-schnell-Q8_0.gguf"
+    }
+  },
+  "5": {
+    "class_type": "EmptySD3LatentImage",
+    "inputs": {
+      "width": 1080,
+      "height": 1920,
+      "batch_size": 1
+    }
+  },
+  "6": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": ["3", 0],
+      "vae": ["7", 0]
+    }
+  },
+  "7": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "ae.safetensors"
+    }
+  },
+  "8": {
+    "class_type": "DualCLIPLoader",
+    "inputs": {
+      "clip_name1": "clip_l.safetensors",
+      "clip_name2": "t5xxl_fp8_e4m3fn.safetensors",
+      "type": "flux"
+    }
+  },
+  "10": {
+    "class_type": "WanImageToVideo",
+    "inputs": {
+      "model": ["11", 0],
+      "image": ["6", 0],
+      "positive": ["1", 0],
+      "negative": ["2", 0],
+      "num_frames": 49,
+      "fps": 16,
+      "seed": 42,
+      "steps": 20,
+      "cfg": 6.0,
+      "noise_aug_strength": 0.02
+    }
+  },
+  "11": {
+    "class_type": "WanModelLoader",
+    "inputs": {
+      "model_name": "wan2.1-i2v-14b-480p.safetensors"
+    }
+  },
+  "12": {
+    "class_type": "VHS_VideoCombine",
+    "inputs": {
+      "images": ["10", 0],
+      "frame_rate": 16,
+      "loop_count": 0,
+      "filename_prefix": "wotd_video",
+      "format": "video/h264-mp4",
+      "save_output": true
+    }
+  }
+}

@@ -5,7 +5,6 @@ Phase 2: TTS via ElevenLabs, Motion Canvas render, FFmpeg merge to final MP4.
 """
 
 import argparse
-import glob
 import json
 import os
 import random
@@ -28,10 +27,11 @@ FALLBACK_PATH = "local_fallback.json"
 OUTPUT_PATH = "data_bridge.json"
 TEMP_DIR = "temp"
 AUDIO_PATH = os.path.join(TEMP_DIR, "audio.mp3")
-FRAMES_DIR = os.path.join(TEMP_DIR, "frames")
 EXPORTS_DIR = "exports"
 EXPORT_PATH = os.path.join(EXPORTS_DIR, "word_of_the_day.mp4")
-MOTION_CANVAS_DIR = "motion-canvas"
+COMFYUI_URL = "http://127.0.0.1:8188"
+COMFYUI_WORKFLOW_PATH = "comfyui_workflow.json"
+COMFYUI_VIDEO_PATH = os.path.join(TEMP_DIR, "comfyui_raw.mp4")
 
 
 # ── Fetcher ──────────────────────────────────────────────────────────────────
@@ -274,78 +274,133 @@ def generate_audio() -> None:
     print(f"[AUDIO] Saved to {AUDIO_PATH} ({size:,} bytes)")
 
 
-# ── Phase 2: Motion Canvas Render ────────────────────────────────────────────
+# ── Phase 2: ComfyUI Render ───────────────────────────────────────────────────
 
-def render_frames() -> None:
-    """Run Motion Canvas headless render via Puppeteer. Output PNGs to temp/frames/."""
-    os.makedirs(FRAMES_DIR, exist_ok=True)
+def render_comfyui() -> None:
+    """Submit workflow to ComfyUI API, poll until done, download output video.
+    Output saved to temp/comfyui_raw.mp4.
+    """
+    import time
+    import urllib.request
+    import urllib.parse
 
-    print("[RENDER] Starting Motion Canvas headless render...")
-    result = subprocess.run(
-        ["node", "render.mjs"],
-        cwd=MOTION_CANVAS_DIR,
-        capture_output=True,
-        text=True,
-        timeout=180,
+    with open(OUTPUT_PATH, "r") as f:
+        data = json.load(f)
+
+    word = data["word"]
+    phonetic = data.get("phonetic", "")
+    definition = data["definitions"][0]
+
+    prompt_text = (
+        f"close-up cinematic photograph, a human hand holding a black pen writing on a nude beige sticky note, "
+        f"the sticky note shows the word '{word}' in large handwritten letters at the top, "
+        f"below it '{phonetic}' in smaller handwritten script, "
+        f"below that a short definition '{definition}' in neat handwriting, "
+        f"warm natural window light, shallow depth of field, photorealistic, 4k, high detail"
     )
 
-    print(result.stdout)
-    if result.returncode != 0:
-        print(f"[RENDER] stderr: {result.stderr}")
-        raise RuntimeError(f"Motion Canvas render failed (exit code {result.returncode})")
+    with open(COMFYUI_WORKFLOW_PATH, "r") as f:
+        workflow_template = f.read()
 
-    # Move rendered frames from motion-canvas/output/*/  →  temp/frames/
-    output_dir = os.path.join(MOTION_CANVAS_DIR, "output")
-    if not os.path.isdir(output_dir):
-        raise RuntimeError(f"Render output directory not found: {output_dir}")
+    escaped_prompt = prompt_text.replace("\\", "\\\\").replace('"', '\\"')
+    workflow_json = workflow_template.replace("{{PROMPT_TEXT}}", escaped_prompt)
+    workflow = json.loads(workflow_json)
 
-    # Find the subdirectory with PNGs
-    frame_files = []
-    for root, dirs, files in os.walk(output_dir):
-        for f in sorted(files):
-            if f.endswith(".png"):
-                frame_files.append(os.path.join(root, f))
+    payload = json.dumps({"prompt": workflow}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{COMFYUI_URL}/prompt",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
 
-    if not frame_files:
-        raise RuntimeError("No PNG frames found in render output")
+    print(f"[COMFYUI] Submitting workflow for word: {word}")
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        result = json.loads(resp.read())
 
-    for i, src in enumerate(frame_files):
-        dst = os.path.join(FRAMES_DIR, f"frame{i:06d}.png")
-        shutil.copy2(src, dst)
+    prompt_id = result.get("prompt_id")
+    if not prompt_id:
+        raise RuntimeError(f"ComfyUI did not return a prompt_id: {result}")
+    print(f"[COMFYUI] Queued. prompt_id={prompt_id}")
 
-    print(f"[RENDER] Copied {len(frame_files)} frames to {FRAMES_DIR}")
+    poll_interval = 10
+    max_wait = 1800  # 30 minutes (Wan I2V is slow on Apple Silicon)
+    elapsed = 0
+    output_filename = None
+    output_subfolder = ""
+
+    while elapsed < max_wait:
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+
+        with urllib.request.urlopen(f"{COMFYUI_URL}/history/{prompt_id}", timeout=15) as resp:
+            history = json.loads(resp.read())
+
+        if prompt_id not in history:
+            print(f"[COMFYUI] Waiting... ({elapsed}s elapsed)")
+            continue
+
+        job = history[prompt_id]
+        status = job.get("status", {})
+
+        if status.get("status_str") == "error":
+            raise RuntimeError(f"ComfyUI job failed: {status.get('messages', [])}")
+
+        outputs = job.get("outputs", {})
+        for node_id, node_output in outputs.items():
+            for file_entry in node_output.get("videos", []):
+                output_filename = file_entry["filename"]
+                output_subfolder = file_entry.get("subfolder", "")
+                break
+            if output_filename:
+                break
+
+        if output_filename:
+            print(f"[COMFYUI] Done after {elapsed}s. Output: {output_filename}")
+            break
+
+        print(f"[COMFYUI] Still running... ({elapsed}s elapsed)")
+
+    if not output_filename:
+        raise RuntimeError(f"ComfyUI job did not complete within {max_wait}s")
+
+    params = urllib.parse.urlencode({
+        "filename": output_filename,
+        "subfolder": output_subfolder,
+        "type": "output",
+    })
+    download_url = f"{COMFYUI_URL}/view?{params}"
+
+    os.makedirs(TEMP_DIR, exist_ok=True)
+    print(f"[COMFYUI] Downloading output video...")
+    urllib.request.urlretrieve(download_url, COMFYUI_VIDEO_PATH)
+
+    size = os.path.getsize(COMFYUI_VIDEO_PATH)
+    print(f"[COMFYUI] Saved to {COMFYUI_VIDEO_PATH} ({size:,} bytes)")
 
 
 # ── Phase 2: FFmpeg Merge ─────────────────────────────────────────────────────
 
-FFMPEG_CMD = [
-    "ffmpeg", "-y",
-    "-framerate", "30",
-    "-i", os.path.join(FRAMES_DIR, "frame%06d.png"),
-    "-i", AUDIO_PATH,
-    "-c:v", "h264_videotoolbox",
-    "-b:v", "8000k",
-    "-pix_fmt", "yuv420p",
-    "-c:a", "aac",
-    "-b:a", "192k",
-    "-shortest",
-    EXPORT_PATH,
-]
-
-
 def merge_video() -> None:
-    """Merge rendered frames + audio into final MP4 using M2 hardware encoder."""
+    """Loop ComfyUI video clip and merge with ElevenLabs audio into final MP4."""
     os.makedirs(EXPORTS_DIR, exist_ok=True)
 
-    print("[FFMPEG] Merging frames + audio...")
-    print(f"[FFMPEG] Command: {' '.join(FFMPEG_CMD)}")
+    ffmpeg_cmd = [
+        "ffmpeg", "-y",
+        "-stream_loop", "-1",        # loop short ComfyUI clip indefinitely
+        "-i", COMFYUI_VIDEO_PATH,
+        "-i", AUDIO_PATH,
+        "-c:v", "h264_videotoolbox", # Apple Silicon hardware encoder
+        "-b:v", "8000k",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-shortest",                 # trim at end of audio track
+        "-movflags", "+faststart",
+        EXPORT_PATH,
+    ]
 
-    result = subprocess.run(
-        FFMPEG_CMD,
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
+    print("[FFMPEG] Merging ComfyUI video + audio...")
+    result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=120)
 
     if result.returncode != 0:
         print(f"[FFMPEG] stderr: {result.stderr}")
@@ -405,6 +460,7 @@ def main():
 
         print("\n[2/5] Generating script via Claude...")
         script = generate_script(word_data)
+        script["phonetic"] = word_data.get("phonetic", "")
 
         with open(OUTPUT_PATH, "w") as f:
             json.dump(script, f, indent=2)
@@ -420,10 +476,10 @@ def main():
         print("\n[3/5] Generating TTS audio via ElevenLabs...")
         generate_audio()
 
-    print("\n[4/5] Rendering animation frames via Motion Canvas...")
-    render_frames()
+    print("\n[4/5] Generating video via ComfyUI API...")
+    render_comfyui()
 
-    print("\n[5/5] Merging frames + audio via FFmpeg (M2 hardware)...")
+    print("\n[5/5] Merging ComfyUI video + audio via FFmpeg (Apple Silicon)...")
     merge_video()
 
     # Cleanup
