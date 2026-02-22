@@ -1,0 +1,12 @@
+venv/
+.env
+.env.*
+data_bridge.json
+__pycache__/
+*.pyc
+node_modules/
+temp/
+exports/
+motion-canvas/output/
+permanent_archive/
+.claude/
